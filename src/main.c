@@ -138,7 +138,7 @@ int main(void) {
 
         BeginDrawing();
         if (currentScr == MAP_EDITOR){
-            ClearBackground(BLACK);
+            ClearBackground(GetColor(0x181818FF));
             DrawMapEditor();
         } 
         else if (currentScr == GAME) {
