@@ -16,39 +16,13 @@
 #define MAX_SECTORS 1000
 #define MAX_WALLS 10000
 #define MAX_VERTICES 100000
-#define NO_LINK -1
 
 #define MODE_EDIT 1
 #define MODE_DRAG 2
+#define MODE_SECTOR
 
 #define SECTOR_VERTEX_MIN 3
 #define SECTOR_WALL_MIN 3
-
-typedef struct Vertex{
-    int id;
-    Vector2 points;
-} Vertex;
-
-typedef struct Wall {
-    int point_start;
-    int point_end;
-    int next_wall;
-    int next_sector;
-    int texture_id;
-    int portal_wall;
-} Wall;
-
-typedef struct Sector {
-    int wall_start;
-    int wall_count;
-    float floor_z;
-    float ceilingz;
-    int floor_texture;
-    int ceiling_texture;
-} Sector;
-
-
-// data structures to store the geometry data
 
 Sector sectors[MAX_SECTORS];
 int sector_counter = 0;
@@ -66,6 +40,9 @@ bool is_drawing_sector = false;
 bool isClickedOn = false;
 int current_sector_start_vertex_id = -1;
 int current_sector_start_wall_id = -1;
+
+Vector2 playerStart = { 0.0f, 0.0f };
+float   playerStartYaw = 0.0f;
 
 Vector2 SnapVertexToGrid(Vector2 vertex, float gridSize) {
     Vector2 snappedVertexVec;
@@ -127,6 +104,7 @@ void HandleDeleteBehavior(){
 }
 
 void DrawMapGeometry(Vector2 snappedVertex, Vector2 mouseWorldPos){
+    DrawCircleV(snappedVertex, 4.0f, YELLOW);
     if (isClickedOn) {
         if (!is_drawing_sector){
             int v_idx = GetOrCreateVertex(snappedVertex);
@@ -221,9 +199,14 @@ void DrawMapEditor() {
     Vector2 mouseScreenPos = GetMousePosition();
     Vector2 mouseWorldPos = GetScreenToWorld2D(mouseScreenPos, editorCamera);
     Vector2 snappedVertex = SnapVertexToGrid(mouseWorldPos, GRID_SPACING);
+
+    // place the player start at the cursor (P), rotate its facing (Q/E)
+    if (IsKeyPressed(KEY_P)) playerStart = mouseWorldPos;
+    if (IsKeyDown(KEY_Q)) playerStartYaw -= 2.0f * GetFrameTime();
+    if (IsKeyDown(KEY_E)) playerStartYaw += 2.0f * GetFrameTime();
     
     Vector2 topLeft = GetScreenToWorld2D((Vector2){0, 0}, editorCamera);
-    Vector2 bottomRight = GetScreenToWorld2D((Vector2){SCREEN_WIDTH, SCREEN_HEIGHT}, editorCamera);
+    Vector2 bottomRight = GetScreenToWorld2D((Vector2){GetScreenWidth(), GetScreenHeight()}, editorCamera);
 
     float startX = floorf(topLeft.x / GRID_SPACING) * GRID_SPACING;
     float endX = ceilf(bottomRight.x / GRID_SPACING) * GRID_SPACING;
@@ -243,7 +226,7 @@ void DrawMapEditor() {
         Vector2 mouseWorldPos = GetScreenToWorld2D(GetMousePosition(), editorCamera);
         editorCamera.offset = GetMousePosition();
         editorCamera.target = mouseWorldPos;
-        editorCamera.zoom += wheel * 0.01f;
+        editorCamera.zoom *= expf(wheel * 0.01f);
         if (editorCamera.zoom < 0.2f) editorCamera.zoom = 0.2f;
         if (editorCamera.zoom > 5.0f) editorCamera.zoom = 5.0f;
     }
@@ -292,30 +275,36 @@ void DrawMapEditor() {
         }
         if (IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
             int d = draggedVertex;
+            int target = -1;
             for (int i = 0; d != -1 && i < vertex_counter; i++) {
                 if (i == d) continue;
-                if (vertices[i].points.x != vertices[d].points.x ||
-                    vertices[i].points.y != vertices[d].points.y) continue;
-
+                if (vertices[i].points.x != vertices[d].points.x &&
+                    vertices[i].points.y != vertices[d].points.y) { target = 1; break;}
+                bool wouldCollapse = false;
                 for (int w = 0; w < wall_counter; w++) {
-                    if (walls[w].point_start == d) walls[w].point_start = i;
-                    if (walls[w].point_end   == d) walls[w].point_end   = i;
-                }
-                int last = vertex_counter - 1;
-                if (d != last) {
-                    vertices[d] = vertices[last];
-                    for (int w = 0; w < wall_counter; w++) {
-                        if (walls[w].point_start == last) walls[w].point_start = d;
-                        if (walls[w].point_end   == last) walls[w].point_end   = d;
+                    if ((walls[w].point_start == d && walls[w].point_end == target) || (walls[w].point_start   == target && walls[w].point_end == d)) {
+                        wouldCollapse = true; break;
                     }
                 }
-                vertex_counter--;
-                break;
-            }
-            draggedVertex = -1;
+                if (target != -1 && !wouldCollapse) {
+                    for (int w = 0; w < wall_counter; w++) {
+                        if (walls[w].point_start == d) walls[w].point_start = target;
+                        if (walls[w].point_end == d) walls[w].point_end = target;
+                    }
+                    int last = vertex_counter - 1;
+                    if (d != last) {
+                        vertices[d] = vertices[last];
+                        for (int w = 0; w < wall_counter; w++) {
+                            if (walls[w].point_start == last) walls[w].point_start = d;
+                            if (walls[w].point_end   == last) walls[w].point_end   = d;
+                        }
+                    }
+                    vertex_counter--;
+                    }                
+                }
+                draggedVertex = -1;
         }
         
-        // render the points clicked on
         for (int i = 0; i < vertex_counter; i++) {
             Vector2 v_point = {vertices[i].points.x, vertices[i].points.y};
             DrawCircleV(v_point, CheckCollisionPointCircle(mouseWorldPos, v_point, pickRadius)? vertexRadius + 4 : vertexRadius, draggedVertex == i ? RAYWHITE : YELLOW);
@@ -344,7 +333,17 @@ void DrawMapEditor() {
             }
         }
 
-        GuiLabel((Rectangle){110, 300, 200, 100}, TextFormat(editorMode == MODE_EDIT ? "Edit Mode" : "Drag Mode"));
+        float markerR = 8.0f / editorCamera.zoom;
+        Vector2 facing = { cosf(playerStartYaw), sinf(playerStartYaw) };
+        Vector2 facingTip = Vector2Add(playerStart, Vector2Scale(facing, markerR * 2.5f));
+        DrawCircleV(playerStart, markerR, GREEN);
+        DrawLineEx(playerStart, facingTip, 2.0f / editorCamera.zoom, LIME);
 
         EndMode2D();
+
+        DrawText(TextFormat(editorMode == MODE_EDIT ? "Edit Mode" : "Drag Mode"), 10, 10, 20, RAYWHITE);
+        DrawText("P: set player start   Q/E: rotate", 10, 35, 20, GRAY);
+        DrawText(TextFormat("SECTORS:%d WALLS:%d VERTICES:%d", sector_counter, wall_counter, vertex_counter),
+         15, 800, 20, WHITE);
+
 }

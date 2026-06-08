@@ -1,6 +1,7 @@
 #include "raylib.h"
 #include "rcamera.h"
 #include "map.h"
+#include "renderer/sectors.h"
 #include "main.h"
 #include <math.h>
 #include <raymath.h>
@@ -8,31 +9,11 @@
 
 #define SCREEN_HEIGHT 820
 #define SCREEN_WIDTH 1460
-#define MAP_HEIGHT 16
-#define MAP_WIDTH 16
 #define DOS_RES_X 320
 #define DOS_RES_Y 200
 #define TILE_SIZE 2.0f
 #define MOVEMENT_SPEED 4.0f
-
-
-int dungeonMap[MAP_HEIGHT][MAP_WIDTH] = {
-    {1,1,1,1,1,1,1,1,1,1,1,1},
-    {1,0,0,0,1,0,0,0,0,0,0,1},
-    {1,0,1,0,1,0,1,1,1,1,0,1},
-    {1,0,1,0,0,0,0,0,0,1,0,1},
-    {1,1,0,1,1,1,1,1,0,1,0,1},
-    {1,0,0,0,0,0,0,1,0,0,0,1},
-    {1,0,1,1,1,1,1,1,1,1,0,1},
-    {1,0,1,1,1,1,1,1,1,1,0,1},
-    {1,0,0,0,1,0,0,0,0,0,0,1},
-    {1,0,1,0,1,0,1,1,1,1,0,1},
-    {1,0,1,0,0,0,0,0,0,1,0,1},
-    {1,1,0,1,1,1,1,1,0,1,0,1},
-    {1,0,0,0,0,0,0,1,0,0,0,1},
-    {1,1,1,1,1,1,1,1,1,1,1,1}
-};
-
+#define SPRINT_SPEED 2.0f
 
 typedef struct {
     Vector3 position;
@@ -54,7 +35,7 @@ Camera setupCamera(){
 
 Player3D setupPlayer(){
     Player3D player = {
-        .position = {2.0f, 0.6f, 2.0f},
+        .position = {2.0f, 0.9f, 2.0f},
         .yaw = 0.0f,
         .moveSpeed = 4.0f,
         .rotationSpeed = 2.5f,
@@ -62,30 +43,6 @@ Player3D setupPlayer(){
     };
     return player;
 };
-
-bool IsCollidingWithMap(Vector3 pos, float radius) {
-    float checkAngles[] = {0, PI/2, 3*PI/2};
-
-    for (int i = 0; i < 4; i++) {
-        float checkX = pos.x + cosf(checkAngles[i] * radius);
-        float checkZ = pos.z + sinf(checkAngles[i] * radius);
-
-        int mapX = (int)roundf(checkX / TILE_SIZE);
-        int mapZ = (int)roundf(checkZ/ TILE_SIZE);
-
-        if (mapX < 0 || mapX >= MAP_WIDTH || mapZ < 0 || mapZ >= MAP_HEIGHT) {
-            return true;
-        }
-
-        if (dungeonMap[mapZ][mapX] == 1) {
-            return true;
-        }
-    }
-
-    return false;
-};
-
-
 
 void debugMovement(Camera *camera){
     
@@ -104,10 +61,6 @@ int main(void) {
     SetTargetFPS(60);
     FlaxScreen currentScr = GAME;
 
-    //setting up cube texture
-    Texture2D wallTexture = LoadTexture("assets/sprites/brickwork.png");
-    Model wallCube = LoadModelFromMesh(GenMeshCube(TILE_SIZE, TILE_SIZE, TILE_SIZE));
-    wallCube.materials[0].maps[MATERIAL_MAP_DIFFUSE].texture = wallTexture;
 
     //setup the player sprite
     Texture2D weaponTex = LoadTexture("assets/sprites/player_test_sprite.png");
@@ -123,6 +76,7 @@ int main(void) {
     RenderTexture2D dosResCanvas = LoadRenderTexture(DOS_RES_X, DOS_RES_Y);
     SetTextureFilter(dosResCanvas.texture, TEXTURE_FILTER_POINT);
     DisableCursor();
+    BuildSectorMeshes();
     while (!WindowShouldClose()) {
 
         if (IsKeyPressed(KEY_M)) {
@@ -133,6 +87,9 @@ int main(void) {
             } else {
                 currentScr = GAME;
                 DisableCursor();
+                BuildSectorMeshes();
+                player.position = SectorToWorld(playerStart, 0.6f);
+                player.yaw = playerStartYaw;
             }
         }
 
@@ -148,42 +105,28 @@ int main(void) {
         if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D)) player.yaw += player.rotationSpeed * dt;
 
         Vector3 forward = {cosf(player.yaw), 0.0f, sinf(player.yaw)};
+        Vector3 forwardSprint = {.x= cosf(player.yaw) * SPRINT_SPEED, .y = 0.0f, .z = sinf(player.yaw) * SPRINT_SPEED};
         Vector3 right = {-sinf(player.yaw), 0.0f, cosf(player.yaw)};
         Vector3 moveDir = {0};
 
         //source rec for curr frame slice
         Rectangle sourceRec = { 0 * frameWidth, 0.0f, frameWidth, frameHeight};
-        // dest rec
-        Rectangle destRec = {weaponScreenPos.x, weaponScreenPos.y, frameWidth * texScale, frameHeight * texScale};
-        if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP)) { 
-            moveDir = Vector3Add(moveDir, forward);
-            weaponScreenPos.x = sinf(GetTime() * 10.f) * 4.0f;
-            weaponScreenPos.y = cosf(GetTime() * 20.0f) * 6.0f;
+        if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP))   moveDir = Vector3Add(moveDir, forward);
+        if (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP) && IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) moveDir = Vector3Add(moveDir, forwardSprint);
+        if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) moveDir = Vector3Subtract(moveDir, forward);
 
+        Vector2 bob = {0};
+        if (Vector3Length(moveDir) > 0.0f) {
+            bob.x = sinf(GetTime() * 10.0f) * 4.0f;
+            bob.y = cosf(GetTime() * 20.0f) * 6.0f;
         }
-        if (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN)) {
-            moveDir = Vector3Subtract(moveDir, forward);
-            weaponScreenPos.x = sinf(GetTime() * 10.f) * 4.0f;
-            weaponScreenPos.y = cosf(GetTime() * 20.0f) * 6.0f;
-
-        }
+        Rectangle destRec = {weaponScreenPos.x + bob.x, weaponScreenPos.y + bob.y, frameWidth * texScale, frameHeight * texScale};
 
         if (Vector3Length(moveDir) > 0.0f) {
             moveDir = Vector3Normalize(moveDir);
-
             Vector3 velocity = Vector3Scale(moveDir, player.moveSpeed * dt);
-
-            Vector3 testPosX = player.position;
-            testPosX.x += velocity.x;
-            if (!IsCollidingWithMap(testPosX, player.playerRadius)) {
-                player.position.x  = testPosX.x;
-            }
-
-            Vector3 testPosZ = player.position;
-            testPosZ.z += velocity.z;
-            if(!IsCollidingWithMap(testPosZ, player.playerRadius)){
-                player.position.z = testPosZ.z;
-            }
+            player.position.x += velocity.x;
+            player.position.z += velocity.z;
         }
 
         camera.position = player.position;
@@ -195,18 +138,7 @@ int main(void) {
         BeginTextureMode(dosResCanvas);
         ClearBackground(RAYWHITE);
         BeginMode3D(camera);
-        for (int y = 0; y < MAP_HEIGHT; y++) {
-            for (int x = 0; x < MAP_WIDTH; x++) {
-                Vector3 tilePos = {x * TILE_SIZE, 0.0f, y * TILE_SIZE};
-
-                if (dungeonMap[y][x] == 1) {
-                    DrawModel(wallCube, tilePos, 1.0f , WHITE);
-                } else {
-                    DrawPlane((Vector3){tilePos.x, -TILE_SIZE/2, tilePos.z}, (Vector2){TILE_SIZE, TILE_SIZE}, GRAY);
-                    DrawPlane((Vector3){tilePos.x, TILE_SIZE/2, tilePos.z}, (Vector2){TILE_SIZE, -TILE_SIZE}, BLACK);
-                }
-            }
-        }
+        DrawSectorWorld();
         EndMode3D();
         EndTextureMode();
 
@@ -218,14 +150,16 @@ int main(void) {
 
         DrawTexturePro(weaponTex, sourceRec, destRec, (Vector2){6, -2}, 0.0f, WHITE);
         debugMovement(&camera);
+        DrawText(TextFormat("sectors:%d walls:%d verts:%d", sector_counter, wall_counter, vertex_counter),
+         15, 60, 20, RED);
+
         }
         EndDrawing();
     }
 
     UnloadTexture(weaponTex);
-    UnloadTexture(wallTexture);
     UnloadRenderTexture(dosResCanvas);
-    UnloadModel(wallCube);
+    UnloadSectorMeshes();
     CloseWindow();
     return 0;
 }
