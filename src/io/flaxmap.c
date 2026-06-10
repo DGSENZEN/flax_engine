@@ -76,6 +76,8 @@ static bool ValidateWorld(const char *origin) {
         if (sec->floor_texture   < 0 || sec->floor_texture   >= texname_counter) sec->floor_texture   = 0;
         if (sec->ceiling_texture < 0 || sec->ceiling_texture >= texname_counter) sec->ceiling_texture = 0;
         if (sec->kind < 0 || sec->kind > SECTOR_DOOR) sec->kind = SECTOR_NORMAL;
+        if (sec->light < 0.0f) sec->light = 0.0f;
+        if (sec->light > 2.0f) sec->light = 2.0f;   // headroom for overbright
     }
     // drop entities with unknown types (newer file), clamp textures
     int kept = 0;
@@ -118,15 +120,15 @@ bool MapSourceSave(const char *path) {
                 WorldTexname(walls[i].texture_id), walls[i].flags, walls[i].tag);
 
     fprintf(f, "\n# sector <index> <wall_start> <wall_count> <floor_z> <ceil_z> <floortex> <ceiltex>"
-               " [floor_slope ceil_slope kind tag]   (%d total)\n", sector_counter);
+               " [floor_slope ceil_slope kind tag light]   (%d total)\n", sector_counter);
     for (int i = 0; i < sector_counter; i++)
-        fprintf(f, "sector %d %d %d %.9g %.9g %s %s %.9g %.9g %d %d\n", i,
+        fprintf(f, "sector %d %d %d %.9g %.9g %s %s %.9g %.9g %d %d %.9g\n", i,
                 sectors[i].wall_start, sectors[i].wall_count,
                 sectors[i].floor_z, sectors[i].ceilingz,
                 WorldTexname(sectors[i].floor_texture),
                 WorldTexname(sectors[i].ceiling_texture),
                 sectors[i].floor_slope, sectors[i].ceil_slope,
-                sectors[i].kind, sectors[i].tag);
+                sectors[i].kind, sectors[i].tag, sectors[i].light);
 
     fprintf(f, "\n# entity <index> <type> <x> <y> <z> <yaw> <sx> <sy> <texture> <data>   (%d total)\n",
             entity_counter);
@@ -200,9 +202,10 @@ bool MapSourceLoad(const char *path) {
         } else if (strcmp(key, "sector") == 0) {
             float fslope = 0.0f, cslope = 0.0f;   // optional trailing fields (v2)
             int kind = 0, tag = 0;
-            int got = sscanf(p, "sector %d %d %d %f %f %31s %31s %f %f %d %d",
+            float light = 1.0f;                   // optional (v3), full bright default
+            int got = sscanf(p, "sector %d %d %d %f %f %31s %31s %f %f %d %d %f",
                              &idx, &ia, &ib, &fa, &fb, tex_a, tex_b,
-                             &fslope, &cslope, &kind, &tag);
+                             &fslope, &cslope, &kind, &tag, &light);
             if (got < 7 || idx != sector_counter || sector_counter >= MAX_SECTORS) {
                 fprintf(stderr, "flaxmap: %s:%d: bad sector line\n", path, lineno);
                 ok = false;
@@ -213,7 +216,7 @@ bool MapSourceLoad(const char *path) {
                     .floor_texture = WorldTexnameId(tex_a),
                     .ceiling_texture = WorldTexnameId(tex_b),
                     .floor_slope = fslope, .ceil_slope = cslope,
-                    .kind = kind, .tag = tag,
+                    .kind = kind, .tag = tag, .light = light,
                 };
             }
         } else if (strcmp(key, "entity") == 0) {
@@ -273,6 +276,7 @@ bool MapBakedSave(const char *path) {
         [LUMP_WALLS]    = (uint32_t)wall_counter    * sizeof(FmapWall),
         [LUMP_SECTORS]  = (uint32_t)sector_counter  * sizeof(FmapSector),
         [LUMP_PLAYER]   = sizeof(FmapPlayer),
+        [LUMP_ENTITIES] = (uint32_t)entity_counter  * sizeof(FmapEntity),
     };
     uint32_t off = sizeof hdr + sizeof dir;
     for (int t = 0; t < LUMP_COUNT; t++) {
@@ -290,19 +294,34 @@ bool MapBakedSave(const char *path) {
         FmapVertex r = { vertices[i].points.x, vertices[i].points.y };
         ok = fwrite(&r, sizeof r, 1, f) == 1;
     }
+    // Records use designated initializers on purpose: a field missing here
+    // is a *silent* data loss bug (the file still round-trips structurally),
+    // so every world field must be named explicitly.
     for (int i = 0; ok && i < wall_counter; i++) {
-        FmapWall r = { walls[i].point_start, walls[i].point_end, walls[i].next_wall,
-                       walls[i].next_sector, walls[i].portal_wall, walls[i].texture_id };
+        FmapWall r = { .v_start = walls[i].point_start, .v_end = walls[i].point_end,
+                       .next_wall = walls[i].next_wall, .next_sector = walls[i].next_sector,
+                       .portal_wall = walls[i].portal_wall, .texture = walls[i].texture_id,
+                       .flags = walls[i].flags, .tag = walls[i].tag };
         ok = fwrite(&r, sizeof r, 1, f) == 1;
     }
     for (int i = 0; ok && i < sector_counter; i++) {
-        FmapSector r = { sectors[i].wall_start, sectors[i].wall_count,
-                         sectors[i].floor_z, sectors[i].ceilingz,
-                         sectors[i].floor_texture, sectors[i].ceiling_texture };
+        FmapSector r = { .wall_start = sectors[i].wall_start, .wall_count = sectors[i].wall_count,
+                         .floor_z = sectors[i].floor_z, .ceil_z = sectors[i].ceilingz,
+                         .floor_tex = sectors[i].floor_texture, .ceil_tex = sectors[i].ceiling_texture,
+                         .floor_slope = sectors[i].floor_slope, .ceil_slope = sectors[i].ceil_slope,
+                         .kind = sectors[i].kind, .tag = sectors[i].tag,
+                         .light = sectors[i].light };
         ok = fwrite(&r, sizeof r, 1, f) == 1;
     }
     if (ok) {
         FmapPlayer r = { playerStart.x, playerStart.y, playerStartYaw };
+        ok = fwrite(&r, sizeof r, 1, f) == 1;
+    }
+    for (int i = 0; ok && i < entity_counter; i++) {
+        FmapEntity r = { .type = entities[i].type,
+                         .x = entities[i].pos.x, .y = entities[i].pos.y, .z = entities[i].z,
+                         .yaw = entities[i].yaw, .sx = entities[i].sx, .sy = entities[i].sy,
+                         .texture = entities[i].texture_id, .data = entities[i].data };
         ok = fwrite(&r, sizeof r, 1, f) == 1;
     }
     fclose(f);
@@ -310,7 +329,10 @@ bool MapBakedSave(const char *path) {
 }
 
 // Read one directory. Returns lump count read into dir[], or -1 on error.
-static int ReadHeaderAndDir(FILE *f, const char *path, FmapLumpEntry dir[], int max_lumps) {
+// The file's format version lands in *out_version (callers pick v1 or v2
+// record layouts from it).
+static int ReadHeaderAndDir(FILE *f, const char *path, FmapLumpEntry dir[],
+                            int max_lumps, uint32_t *out_version) {
     FmapHeader hdr;
     if (fread(&hdr, sizeof hdr, 1, f) != 1 ||
         memcmp(hdr.magic, FLAXMAP_MAGIC, 4) != 0) {
@@ -330,6 +352,7 @@ static int ReadHeaderAndDir(FILE *f, const char *path, FmapLumpEntry dir[], int 
         fprintf(stderr, "flaxmap: %s: truncated lump directory\n", path);
         return -1;
     }
+    *out_version = hdr.version;
     return (int)hdr.lump_count;
 }
 
@@ -338,7 +361,8 @@ bool MapBakedLoad(const char *path) {
     if (!f) return false;
 
     FmapLumpEntry dir[64];
-    int nlumps = ReadHeaderAndDir(f, path, dir, 64);
+    uint32_t version = FLAXMAP_VERSION;
+    int nlumps = ReadHeaderAndDir(f, path, dir, 64, &version);
     if (nlumps < 0) { fclose(f); return false; }
 
     WorldClear();
@@ -373,27 +397,73 @@ bool MapBakedLoad(const char *path) {
             break;
 
         case LUMP_WALLS:
-            n = dir[l].length / sizeof(FmapWall);
+            n = dir[l].length / (version == 1 ? sizeof(FmapWallV1) : sizeof(FmapWall));
             if (n > MAX_WALLS) { ok = false; break; }
             for (uint32_t i = 0; ok && i < n; i++) {
-                FmapWall r;
-                ok = fread(&r, sizeof r, 1, f) == 1;
-                walls[i] = (Wall){ r.v_start, r.v_end, r.next_wall,
-                                   r.next_sector, r.texture, r.portal_wall };
+                FmapWall r = { 0 };
+                if (version == 1) {
+                    FmapWallV1 r1;
+                    ok = fread(&r1, sizeof r1, 1, f) == 1;
+                    r = (FmapWall){ .v_start = r1.v_start, .v_end = r1.v_end,
+                                    .next_wall = r1.next_wall, .next_sector = r1.next_sector,
+                                    .portal_wall = r1.portal_wall, .texture = r1.texture };
+                } else {
+                    ok = fread(&r, sizeof r, 1, f) == 1;
+                }
+                walls[i] = (Wall){ .point_start = r.v_start, .point_end = r.v_end,
+                                   .next_wall = r.next_wall, .next_sector = r.next_sector,
+                                   .texture_id = r.texture, .portal_wall = r.portal_wall,
+                                   .flags = r.flags, .tag = r.tag };
             }
             wall_counter = (int)n;
             break;
 
-        case LUMP_SECTORS:
-            n = dir[l].length / sizeof(FmapSector);
+        case LUMP_SECTORS: {
+            size_t rec = version == 1 ? sizeof(FmapSectorV1)
+                       : version == 2 ? sizeof(FmapSectorV2) : sizeof(FmapSector);
+            n = dir[l].length / rec;
             if (n > MAX_SECTORS) { ok = false; break; }
             for (uint32_t i = 0; ok && i < n; i++) {
-                FmapSector r;
-                ok = fread(&r, sizeof r, 1, f) == 1;
-                sectors[i] = (Sector){ r.wall_start, r.wall_count,
-                                       r.floor_z, r.ceil_z, r.floor_tex, r.ceil_tex };
+                FmapSector r = { .light = 1.0f };
+                if (version == 1) {
+                    FmapSectorV1 r1;
+                    ok = fread(&r1, sizeof r1, 1, f) == 1;
+                    r = (FmapSector){ .wall_start = r1.wall_start, .wall_count = r1.wall_count,
+                                      .floor_z = r1.floor_z, .ceil_z = r1.ceil_z,
+                                      .floor_tex = r1.floor_tex, .ceil_tex = r1.ceil_tex,
+                                      .light = 1.0f };
+                } else if (version == 2) {
+                    FmapSectorV2 r2;
+                    ok = fread(&r2, sizeof r2, 1, f) == 1;
+                    r = (FmapSector){ .wall_start = r2.wall_start, .wall_count = r2.wall_count,
+                                      .floor_z = r2.floor_z, .ceil_z = r2.ceil_z,
+                                      .floor_tex = r2.floor_tex, .ceil_tex = r2.ceil_tex,
+                                      .floor_slope = r2.floor_slope, .ceil_slope = r2.ceil_slope,
+                                      .kind = r2.kind, .tag = r2.tag, .light = 1.0f };
+                } else {
+                    ok = fread(&r, sizeof r, 1, f) == 1;
+                }
+                sectors[i] = (Sector){ .wall_start = r.wall_start, .wall_count = r.wall_count,
+                                       .floor_z = r.floor_z, .ceilingz = r.ceil_z,
+                                       .floor_texture = r.floor_tex, .ceiling_texture = r.ceil_tex,
+                                       .floor_slope = r.floor_slope, .ceil_slope = r.ceil_slope,
+                                       .kind = r.kind, .tag = r.tag, .light = r.light };
             }
             sector_counter = (int)n;
+            break;
+        }
+
+        case LUMP_ENTITIES:
+            n = dir[l].length / sizeof(FmapEntity);
+            if (n > MAX_ENTITIES) { ok = false; break; }
+            for (uint32_t i = 0; ok && i < n; i++) {
+                FmapEntity r;
+                ok = fread(&r, sizeof r, 1, f) == 1;
+                entities[i] = (Entity){ .type = r.type, .pos = { r.x, r.y }, .z = r.z,
+                                        .yaw = r.yaw, .sx = r.sx, .sy = r.sy,
+                                        .texture_id = r.texture, .data = r.data };
+            }
+            entity_counter = (int)n;
             break;
 
         case LUMP_PLAYER: {
@@ -426,18 +496,19 @@ bool MapBakedLoad(const char *path) {
 
 bool MapBakedDump(const char *path, FILE *out) {
     static const char *lump_names[LUMP_COUNT] =
-        { "TEXNAMES", "VERTICES", "WALLS", "SECTORS", "PLAYER" };
+        { "TEXNAMES", "VERTICES", "WALLS", "SECTORS", "PLAYER", "ENTITIES" };
 
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "flaxmap: cannot open %s\n", path); return false; }
 
     FmapLumpEntry dir[64];
-    int nlumps = ReadHeaderAndDir(f, path, dir, 64);
+    uint32_t version = 0;
+    int nlumps = ReadHeaderAndDir(f, path, dir, 64, &version);
     fclose(f);
     if (nlumps < 0) return false;
 
     fprintf(out, "%s\n", path);
-    fprintf(out, "  magic   FMAP   version %d   lumps %d\n\n", FLAXMAP_VERSION, nlumps);
+    fprintf(out, "  magic   FMAP   version %u   lumps %d\n\n", version, nlumps);
     fprintf(out, "  %-3s %-10s %8s %8s\n", "id", "lump", "offset", "length");
     for (int l = 0; l < nlumps; l++) {
         const char *nm = dir[l].type < LUMP_COUNT ? lump_names[dir[l].type] : "?UNKNOWN";
@@ -457,10 +528,19 @@ bool MapBakedDump(const char *path, FILE *out) {
         int portals = 0;
         for (int i = 0; i < sectors[s].wall_count; i++)
             if (walls[sectors[s].wall_start + i].next_sector != NO_LINK) portals++;
-        fprintf(out, "  sector %3d  walls %d..%d  floor %.9g ceil %.9g  portals %d  flr %s ceil %s\n",
+        fprintf(out, "  sector %3d  walls %d..%d  floor %.9g ceil %.9g  slope %.9g/%.9g"
+                     "  kind %d tag %d  light %.9g  portals %d  flr %s ceil %s\n",
                 s, sectors[s].wall_start, sectors[s].wall_start + sectors[s].wall_count - 1,
-                sectors[s].floor_z, sectors[s].ceilingz, portals,
+                sectors[s].floor_z, sectors[s].ceilingz,
+                sectors[s].floor_slope, sectors[s].ceil_slope,
+                sectors[s].kind, sectors[s].tag, sectors[s].light, portals,
                 WorldTexname(sectors[s].floor_texture), WorldTexname(sectors[s].ceiling_texture));
     }
+    for (int e = 0; e < entity_counter; e++)
+        fprintf(out, "  entity %3d  %s  (%.9g, %.9g) z %.9g yaw %.9g  %gx%g  tex %s data %d\n",
+                e, EntityTypeName(entities[e].type),
+                entities[e].pos.x, entities[e].pos.y, entities[e].z, entities[e].yaw,
+                entities[e].sx, entities[e].sy,
+                WorldTexname(entities[e].texture_id), entities[e].data);
     return true;
 }

@@ -36,12 +36,12 @@
 //   vertex  <index> <x> <y>                          indices must be 0,1,2,...
 //   wall    <index> <v_start> <v_end> <texname> [flags tag]
 //   sector  <index> <wall_start> <wall_count> <floor_z> <ceil_z> <flrtex> <ceiltex>
-//                   [floor_slope ceil_slope kind tag]
+//                   [floor_slope ceil_slope kind tag light]
 //   entity  <index> <TYPE> <x> <y> <z> <yaw> <sx> <sy> <texname> <data>
 //
 // Bracketed fields are optional and default to 0 - every v1 .map file is a
-// valid v2 file. TYPE is DECAL / SPAWN / BRIDGE. Unknown keywords are warned
-// about and skipped (forward compatibility).
+// valid v2 file. TYPE is DECAL / SPAWN / BRIDGE / AMMO / HEALTH. Unknown
+// keywords are warned about and skipped (forward compatibility).
 //
 // -------------------------- BINARY LAYOUT (.fmap) --------------------------
 //
@@ -60,7 +60,8 @@
 //                          portal_wall, texture, flags, tag }
 //   LUMP_SECTORS    N x { i32 wall_start, wall_count; f32 floor_z, ceil_z;
 //                          i32 floor_tex, ceil_tex;
-//                          f32 floor_slope, ceil_slope; i32 kind, tag }
+//                          f32 floor_slope, ceil_slope; i32 kind, tag;
+//                          f32 light }
 //   LUMP_PLAYER     1 x { f32 x, y, yaw }
 //   LUMP_ENTITIES   N x { i32 type; f32 x, y, z, yaw, sx, sy;
 //                          i32 texture, data }
@@ -68,11 +69,12 @@
 // Version history (the loader reads all of them; the writer emits latest):
 //   v1  walls without flags/tag, sectors without slopes/kind/tag, no
 //       LUMP_ENTITIES. Old record sizes are kept below as Fmap*V1.
-//   v2  current.
+//   v2  sectors without light (FmapSectorV2).
+//   v3  current.
 // ===========================================================================
 
 #define FLAXMAP_MAGIC   "FMAP"
-#define FLAXMAP_VERSION 2
+#define FLAXMAP_VERSION 3
 
 typedef enum {
     LUMP_TEXNAMES = 0,
@@ -95,14 +97,17 @@ typedef struct { int32_t v_start, v_end, next_wall, next_sector, portal_wall, te
                  flags, tag; } FmapWall;
 typedef struct { int32_t wall_start, wall_count; float floor_z, ceil_z;
                  int32_t floor_tex, ceil_tex; float floor_slope, ceil_slope;
-                 int32_t kind, tag; } FmapSector;
+                 int32_t kind, tag; float light; } FmapSector;
 typedef struct { float x, y, yaw; } FmapPlayer;
 typedef struct { int32_t type; float x, y, z, yaw, sx, sy; int32_t texture, data; } FmapEntity;
 
-// Frozen v1 record layouts, read-only back-compat.
+// Frozen older record layouts, read-only back-compat.
 typedef struct { int32_t v_start, v_end, next_wall, next_sector, portal_wall, texture; } FmapWallV1;
 typedef struct { int32_t wall_start, wall_count; float floor_z, ceil_z;
                  int32_t floor_tex, ceil_tex; } FmapSectorV1;
+typedef struct { int32_t wall_start, wall_count; float floor_z, ceil_z;
+                 int32_t floor_tex, ceil_tex; float floor_slope, ceil_slope;
+                 int32_t kind, tag; } FmapSectorV2;
 
 // --- text source ------------------------------------------------------------
 bool MapSourceSave(const char *path);   // world -> .map text

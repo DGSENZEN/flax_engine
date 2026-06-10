@@ -1,28 +1,44 @@
 # Flax map source. Hand-editable; '#' starts a comment.
 # Bake for the engine with: flaxpack pack <this file> <out.fmap>
 # Portal links are not stored here - they are recompiled on load.
-flaxmap 2
+flaxmap 3
 
 player -100 0 0
 
-# vertex <index> <x> <y>   (15 total)
+# vertex <index> <x> <y>   (31 total)
 vertex 0 -200 -100
 vertex 1 0 -100
 vertex 2 0 100
 vertex 3 -200 100
 vertex 4 300 -100
 vertex 5 300 100
-vertex 6 -50 -250
-vertex 7 -0 -350
+vertex 6 -100 -200
+vertex 7 -100 -300
 vertex 8 300 -350
 vertex 9 350 -250
-vertex 10 -400 -400
-vertex 11 -500 -800
-vertex 12 -500 -1000
-vertex 13 400 -1000
+vertex 10 -600 -350
+vertex 11 -650 -850
+vertex 12 -500 -1100
+vertex 13 450 -1000
 vertex 14 400 -450
+vertex 15 -400 100
+vertex 16 -400 -100
+vertex 17 -1250 -1600
+vertex 18 -900 -1400
+vertex 19 -750 -650
+vertex 20 -1300 -150
+vertex 21 -2050 -200
+vertex 22 -3150 -600
+vertex 23 -3300 -1600
+vertex 24 -2600 -2050
+vertex 25 -1600 -1800
+vertex 26 -1600 -1100
+vertex 27 -1650 -650
+vertex 28 -2600 -850
+vertex 29 -2600 -1400
+vertex 30 -1950 -1350
 
-# wall <index> <v_start> <v_end> <texture> [flags tag]   (21 total)
+# wall <index> <v_start> <v_end> <texture> [flags tag]   (46 total)
 wall 0 0 1 BRICK 0 0
 wall 1 1 2 BRICK 0 0
 wall 2 2 3 BRICK 0 0
@@ -31,12 +47,12 @@ wall 4 1 4 PANEL 0 0
 wall 5 4 5 PANEL 0 0
 wall 6 5 2 PANEL 0 0
 wall 7 2 1 PANEL 0 0
-wall 8 1 6 DEFAULT 0 0
-wall 9 6 7 DEFAULT 0 0
-wall 10 7 8 DEFAULT 0 0
-wall 11 8 9 DEFAULT 0 0
-wall 12 9 4 DEFAULT 0 0
-wall 13 4 1 DEFAULT 0 0
+wall 8 8 9 CEIL 0 0
+wall 9 9 4 CEIL 0 0
+wall 10 4 1 DEFAULT 0 0
+wall 11 1 6 PANEL 0 0
+wall 12 6 7 FLOOR 0 0
+wall 13 7 8 DEFAULT 0 0
 wall 14 7 10 STONE 0 0
 wall 15 10 11 DEFAULT 0 0
 wall 16 11 12 DEFAULT 0 0
@@ -44,11 +60,43 @@ wall 17 12 13 DEFAULT 0 0
 wall 18 13 14 STONE 0 0
 wall 19 14 8 BRICK 0 0
 wall 20 8 7 DEFAULT 0 0
+wall 21 0 3 STONE 0 0
+wall 22 3 15 STONE 0 0
+wall 23 15 16 STONE 0 0
+wall 24 16 0 STONE 0 0
+wall 25 17 18 DEFAULT 0 0
+wall 26 18 12 DEFAULT 0 0
+wall 27 12 11 DEFAULT 0 0
+wall 28 11 19 DEFAULT 0 0
+wall 29 19 20 DEFAULT 0 0
+wall 30 20 21 DEFAULT 0 0
+wall 31 21 22 DEFAULT 0 0
+wall 32 22 23 DEFAULT 0 0
+wall 33 23 24 DEFAULT 0 0
+wall 34 24 25 DEFAULT 0 0
+wall 35 25 17 DEFAULT 0 0
+wall 36 26 30 BRICK 0 0
+wall 37 30 29 BRICK 0 0
+wall 38 29 28 BRICK 0 0
+wall 39 28 27 BRICK 0 0
+wall 40 27 26 BRICK 0 0
+wall 41 26 27 BRICK 0 0
+wall 42 27 28 BRICK 0 0
+wall 43 28 29 BRICK 0 0
+wall 44 29 30 BRICK 0 0
+wall 45 30 26 BRICK 0 0
 
-# sector <index> <wall_start> <wall_count> <floor_z> <ceil_z> <floortex> <ceiltex> [floor_slope ceil_slope kind tag]   (4 total)
-sector 0 0 4 0 10 FLOOR CEIL 0 0 0 0
-sector 1 4 4 1.5 8 STONE CEIL 0 0 0 0
-sector 2 8 6 0 10 DEFAULT DEFAULT 0 0 0 0
-sector 3 14 7 0 10 STONE CEIL 0 0 0 0
+# sector <index> <wall_start> <wall_count> <floor_z> <ceil_z> <floortex> <ceiltex> [floor_slope ceil_slope kind tag light]   (7 total)
+sector 0 0 4 0 10 FLOOR CEIL 0 0 0 0 1
+sector 1 4 4 1.5 8 STONE CEIL 0 0 0 0 1
+sector 2 8 6 0 12.7818089 DEFAULT DEFAULT -0.00919828936 0.00247767917 0 0 0.5
+sector 3 14 7 -1.8526783 10 STONE PANEL 0.00493117329 0.00529575814 0 0 1
+sector 4 21 4 0 10 STONE CEIL 0.00749999983 0 0 0 1
+sector 5 25 16 0 10 FLOOR DEFAULT 0 0 0 0 1
+sector 6 41 5 1.5 10 DEFAULT DEFAULT 0 0 0 0 1.29999995
 
-# entity <index> <type> <x> <y> <z> <yaw> <sx> <sy> <texture> <data>   (0 total)
+# entity <index> <type> <x> <y> <z> <yaw> <sx> <sy> <texture> <data>   (4 total)
+entity 0 AMMO -80 45 0 0 8 0 DEFAULT 0
+entity 1 AMMO 175 45 0 0 50 0 DEFAULT 1
+entity 2 HEALTH 100 -55 0 0 0 0 DEFAULT 35
+entity 3 HEALTH -1000 -850 0 0 0 0 DEFAULT 25

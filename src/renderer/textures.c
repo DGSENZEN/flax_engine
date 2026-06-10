@@ -121,6 +121,23 @@ static Image GenDefault(void) {
                            (Color){ 88, 88, 96, 255 });
 }
 
+static Image GenBulletHole(void) {
+    Image img = GenImageColor(16, 16, BLANK);
+    ImageDrawCircle(&img, 8, 8, 6, (Color){ 30, 26, 24, 90 });    // scorch halo
+    ImageDrawCircle(&img, 8, 8, 4, (Color){ 24, 20, 18, 220 });
+    ImageDrawCircle(&img, 8, 8, 2, (Color){ 8, 6, 6, 255 });      // punched core
+    // chipped rim - fixed offsets, the random spin at spawn does the variety
+    static const int chip[][2] = { {12,6}, {4,12}, {11,11}, {5,4}, {8,13} };
+    for (int i = 0; i < 5; i++)
+        ImageDrawPixel(&img, chip[i][0], chip[i][1], (Color){ 40, 34, 30, 160 });
+    return img;
+}
+
+static Image GenPuff(void) {
+    // soft radial blob - impact puffs, projectile glow, future muzzle smoke
+    return GenImageGradientRadial(32, 32, 0.0f, WHITE, BLANK);
+}
+
 // ---------------------------------------------------------------------------
 
 void TexturesInit(void) {
@@ -132,6 +149,8 @@ void TexturesInit(void) {
     AddTexture("FLOOR",   GenFloor());
     AddTexture("CEIL",    GenCeil());
     AddTexture("PANEL",   GenPanel());
+    AddTexture("BULLETHOLE", GenBulletHole());
+    AddTexture("PUFF",       GenPuff());
 
     int builtins = g_reg_count;
     int loaded = 0;
@@ -178,4 +197,10 @@ Texture2D TexRegistryTexture(int index) {
 int TexRegistryResolve(int world_texture_id) {
     int i = FindByName(WorldTexname(world_texture_id));
     return (i >= 0) ? i : 0;
+}
+
+int TexRegistryFind(const char *name) {
+    char canon[TEXNAME_LEN];
+    Canonical(canon, name);
+    return FindByName(canon);
 }

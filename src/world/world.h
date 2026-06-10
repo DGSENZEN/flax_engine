@@ -1,3 +1,4 @@
+
 #ifndef FLAX_WORLD_H
 #define FLAX_WORLD_H
 
@@ -55,11 +56,12 @@ typedef struct Wall {
 typedef enum { SECTOR_NORMAL = 0, SECTOR_DOOR = 1 } SectorKind;
 
 typedef struct Sector {
-    int wall_start, wall_count;   // contiguous run in walls[]
+    int wall_start, wall_count;   // contiguous run in walls[] (all loops)
     float floor_z, ceilingz;
     int floor_texture, ceiling_texture;   // world_texnames indices
     float floor_slope, ceil_slope;        // rise per map-unit from first wall, 0 = flat
     int kind, tag;                        // SectorKind / trigger tag
+    float light;                          // brightness multiplier, 1 = full (Doom light level)
 } Sector;
 
 // Entities: everything placed in the world that is not sector geometry.
@@ -69,17 +71,25 @@ typedef enum {
     ENT_DECAL  = 0,    // textured quad glued to the nearest wall
     ENT_SPAWN  = 1,    // enemy spawn point (data = enemy class)
     ENT_BRIDGE = 2,    // free-standing walkable box (the sector-engine bridge)
+    ENT_AMMO   = 3,    // pickup: data = AmmoType, sx = amount
+    ENT_HEALTH = 4,    // pickup: data = amount
     ENT_TYPE_COUNT
 } EntityType;
+
+typedef enum {
+    AMMO_SHELLS = 0,
+    AMMO_BULLETS = 1,
+    AMMO_TYPE_COUNT
+} AmmoType;
 
 typedef struct Entity {
     int     type;       // EntityType
     Vector2 pos;        // map coordinates
-    float   z;          // world height: decal center / bridge top / spawn unused
+    float   z;          // type-specific height/offset
     float   yaw;        // radians: bridge rotation, spawn facing
     float   sx, sy;     // half-extents in world units: decal w/h, bridge w/d
     int     texture_id; // world_texnames index (decal/bridge surface)
-    int     data;       // spawn: enemy class id; spare for the rest
+    int     data;       // type-specific small integer payload
 } Entity;
 
 extern Vertex vertices[];
@@ -106,8 +116,8 @@ int  WorldTexnameId(const char *name);
 // Name for a texture id; out-of-range ids resolve to "DEFAULT".
 const char *WorldTexname(int id);
 
-// Entity type <-> canonical name ("DECAL", "SPAWN", "BRIDGE"), for the text
-// format and editor labels. Unknown names return -1.
+// Entity type <-> canonical name, for the text format and editor labels.
+// Unknown names return -1.
 const char *EntityTypeName(int type);
 int         EntityTypeFromName(const char *name);
 
@@ -123,5 +133,16 @@ int WorldSectorAt(Vector2 p);
 // floor_z/ceilingz). Out-of-range sector returns 0 / a tall ceiling.
 float WorldFloorZAt(int s, Vector2 p);
 float WorldCeilZAt(int s, Vector2 p);
+
+// World-space plane normals, slope-aware: floor points up, ceiling down.
+// Shared by the renderer (shading) and the raycaster (hit normals).
+Vector3 WorldFloorNormal(int s);
+Vector3 WorldCeilNormal(int s);
+
+// Split a sector's wall run into its closed loops by following the
+// point_end -> point_start chains. Loop 0 is the outer boundary; later
+// loops are holes (columns). Fills loop_counts (walls per loop) and
+// returns the loop count, capped at max_loops.
+int WorldSectorLoops(int s, int *loop_counts, int max_loops);
 
 #endif // FLAX_WORLD_H

@@ -1,6 +1,7 @@
 #include "map.h"
 #include "config.h"
 #include "io/flaxmap.h"
+#include "world/triangulate.h"
 #include "renderer/textures.h"
 #include "core/log.h"
 #include "raylib.h"
@@ -67,7 +68,14 @@ static const Color COL_DIM       = { 110, 150, 128, 255 };// dim phosphor
 // Editor state - everything the editor mutates lives here, not in scattered
 // file globals and function statics.
 // ---------------------------------------------------------------------------
-typedef enum { MODE_EDIT = 0, MODE_DRAG, MODE_SECTOR, MODE_WALL } EditorMode;
+typedef enum {
+    MODE_EDIT = 0,
+    MODE_DRAG,
+    MODE_SECTOR,
+    MODE_WALL,
+    MODE_HOLE,
+    MODE_ENTITY
+} EditorMode;
 
 typedef struct {
     Camera2D   camera;
@@ -78,11 +86,15 @@ typedef struct {
     int  start_wall;       // wall_counter when the loop began
 
     bool    rect_dragging; // shift-drag rectangle tool in EDIT mode
+    bool    rect_stairs;   // ctrl+shift variant: stamp a staircase instead
     Vector2 rect_anchor;   // first corner of that rectangle (snapped)
 
     int  dragged_vertex;   // vertex being moved, or -1
+    int  dragged_entity;   // entity being moved, or -1
     int  selected_sector;  // sector under inspection, or -1
     int  selected_wall;    // wall under inspection (WALL mode), or -1
+    int  selected_entity;  // entity under inspection, or -1
+    int  entity_brush_type;
 
     bool geometry_dirty;   // portals are rebuilt only when this is set
 
@@ -97,8 +109,11 @@ static EditorState g_ed = {
     .start_wall = -1,
     .rect_dragging = false,
     .dragged_vertex = -1,
+    .dragged_entity = -1,
     .selected_sector = -1,
     .selected_wall = -1,
+    .selected_entity = -1,
+    .entity_brush_type = ENT_AMMO,
     .geometry_dirty = true,        // force a rebuild on first frame
 };
 
@@ -107,6 +122,9 @@ static bool g_style_ready = false;
 // ===========================================================================
 // World helpers
 // ===========================================================================
+
+static void PruneOrphanVertices(void);
+static void EditorStatus(EditorState *st, const char *msg);
 
 static uint32_t MakeUniqueId(void) {
     static uint32_t current_id = INVALID_ID;
@@ -172,6 +190,38 @@ static int WallUnderPoint(Vector2 p, float r) {
     return best;
 }
 
+static int EntityUnderPoint(Vector2 p, float r) {
+    int best = -1;
+    float bestSq = r * r;
+    for (int e = 0; e < entity_counter; e++) {
+        float dSq = Vector2DistanceSqr(p, entities[e].pos);
+        if (dSq < bestSq) { bestSq = dSq; best = e; }
+    }
+    return best;
+}
+
+static Entity EntityDefault(int type, Vector2 p) {
+    Entity e = { .type = type, .pos = p, .texture_id = 0 };
+    switch (type) {
+    case ENT_DECAL:  e.z = 4.0f; e.sx = 2.0f;  e.sy = 2.0f;  break;
+    case ENT_SPAWN:  e.yaw = playerStartYaw;                         break;
+    case ENT_BRIDGE: e.z = 2.0f; e.sx = 2.0f;  e.sy = 2.0f;  break;
+    case ENT_HEALTH: e.data = 25;                                    break;
+    case ENT_AMMO:
+    default:         e.type = ENT_AMMO; e.data = AMMO_SHELLS; e.sx = 8.0f; break;
+    }
+    return e;
+}
+
+static void DeleteEntity(EditorState *st, int idx) {
+    if (idx < 0 || idx >= entity_counter) return;
+    memmove(&entities[idx], &entities[idx + 1], (size_t)(entity_counter - idx - 1) * sizeof(Entity));
+    entity_counter--;
+    st->selected_entity = -1;
+    st->dragged_entity = -1;
+    EditorStatus(st, "ENTITY DELETED");
+}
+
 // Step a world texture id forward/back through the texture registry. The
 // world stores names, so cycling goes registry index -> name -> world id.
 static int CycleWorldTexture(int world_id, int dir) {
@@ -190,7 +240,8 @@ static void EditorStatus(EditorState *st, const char *msg) {
 // Rectangle tool: stamp a 4-wall sector between two snapped corners. Always
 // emitted in the same winding, so two adjacent stamped rooms traverse their
 // shared edge in opposite directions and the portal compiler links them.
-static void CreateRectSector(EditorState *st, Vector2 p, Vector2 q) {
+static void CreateRectSectorEx(EditorState *st, Vector2 p, Vector2 q,
+                               float floor_z, float ceil_z) {
     if (p.x == q.x || p.y == q.y) return;                      // zero-area
     if (wall_counter + 4 > MAX_WALLS || sector_counter >= MAX_SECTORS) return;
 
@@ -213,10 +264,167 @@ static void CreateRectSector(EditorState *st, Vector2 p, Vector2 q) {
     }
     sectors[sector_counter++] = (Sector){
         .wall_start = start, .wall_count = 4,
-        .floor_z = 0.0f, .ceilingz = 10.0f,
+        .floor_z = floor_z, .ceilingz = ceil_z,
         .floor_texture = 0, .ceiling_texture = 0,
+        .light = 1.0f,
     };
     st->geometry_dirty = true;
+}
+
+static void CreateRectSector(EditorState *st, Vector2 p, Vector2 q) {
+    CreateRectSectorEx(st, p, q, 0.0f, 10.0f);
+}
+
+#define STAIR_RISE 1.0f    // per step, comfortably under the player's 1.8 step-up
+
+// Stair tool: slice the dragged rect into one-grid-cell steps along its
+// dominant axis, each its own sector, floors ascending from the anchor end.
+// Shared edges reuse the same grid vertices, so the portal compiler links
+// every riser - the player just walks up via step-up.
+static void StampStairs(EditorState *st, Vector2 p, Vector2 q) {
+    float dx = q.x - p.x, dy = q.y - p.y;
+    if (dx == 0.0f || dy == 0.0f) return;
+    bool alongX = fabsf(dx) >= fabsf(dy);
+    int steps = (int)roundf((alongX ? fabsf(dx) : fabsf(dy)) / GRID_SPACING);
+    if (steps < 2) { CreateRectSector(st, p, q); return; }
+    if (wall_counter + 4 * steps > MAX_WALLS ||
+        sector_counter + steps > MAX_SECTORS) return;
+
+    float dir = (alongX ? dx : dy) > 0.0f ? 1.0f : -1.0f;
+    for (int i = 0; i < steps; i++) {
+        float lo = (float)i * GRID_SPACING * dir;
+        float hi = (float)(i + 1) * GRID_SPACING * dir;
+        Vector2 c0, c1;
+        if (alongX) { c0 = (Vector2){ p.x + lo, p.y }; c1 = (Vector2){ p.x + hi, q.y }; }
+        else        { c0 = (Vector2){ p.x, p.y + lo }; c1 = (Vector2){ q.x, p.y + hi }; }
+        float f = (float)i * STAIR_RISE;
+        CreateRectSectorEx(st, c0, c1, f, f + 10.0f);
+    }
+}
+
+// next_wall is the intra-loop chain; any structural edit (hole insertion,
+// wall split, hinge rotation) re-derives every sector's chains from the
+// point connectivity.
+static void RebuildNextWalls(void) {
+    for (int s = 0; s < sector_counter; s++) {
+        int lc[16];
+        int nl = WorldSectorLoops(s, lc, 16);
+        int off = sectors[s].wall_start;
+        for (int k = 0; k < nl; k++) {
+            for (int i = 0; i < lc[k]; i++)
+                walls[off + i].next_wall = off + (i + 1) % lc[k];
+            off += lc[k];
+        }
+    }
+}
+
+// Move a sector's hinge (slope reference line) to its next wall by rotating
+// the wall records one slot within the sector's FIRST loop (holes keep
+// their place). Portal back-references shift, fixed by the usual recompile.
+static void RotateSectorHinge(EditorState *st, int s) {
+    int lc[16];
+    int nl = WorldSectorLoops(s, lc, 16);
+    if (nl < 1 || lc[0] < 2) return;
+    int start = sectors[s].wall_start, n = lc[0];
+    Wall first = walls[start];
+    for (int i = 0; i < n - 1; i++) walls[start + i] = walls[start + i + 1];
+    walls[start + n - 1] = first;
+    RebuildNextWalls();
+    st->geometry_dirty = true;
+}
+
+static int SectorOwningWall(int w) {
+    for (int s = 0; s < sector_counter; s++)
+        if (w >= sectors[s].wall_start &&
+            w <  sectors[s].wall_start + sectors[s].wall_count) return s;
+    return -1;
+}
+
+// Insert a vertex into wall w, making two walls in its sector's run.
+static bool SplitWallAt(int w, Vector2 p) {
+    int s = SectorOwningWall(w);
+    if (s < 0 || wall_counter >= MAX_WALLS) return false;
+    int nv = GetOrCreateVertex(p);
+    if (nv == -1 || nv == walls[w].point_start || nv == walls[w].point_end) return false;
+
+    memmove(&walls[w + 2], &walls[w + 1], (size_t)(wall_counter - (w + 1)) * sizeof(Wall));
+    wall_counter++;
+    walls[w + 1] = walls[w];                  // second half inherits texture/flags
+    walls[w + 1].point_start = nv;
+    walls[w + 1].next_sector = NO_LINK;       // links recompile after the edit
+    walls[w + 1].portal_wall = NO_LINK;
+    walls[w].point_end = nv;
+    walls[w].next_sector = NO_LINK;
+    walls[w].portal_wall = NO_LINK;
+
+    sectors[s].wall_count++;
+    for (int r = 0; r < sector_counter; r++)
+        if (r != s && sectors[r].wall_start > w) sectors[r].wall_start++;
+    return true;
+}
+
+// Split the selected wall at the cursor's projection onto it. A portal's
+// partner wall splits at the same point, so both pairs of halves share
+// exact edges again and the compiler relinks them.
+static void SplitSelectedWall(EditorState *st, Vector2 mouseWorld) {
+    int w = st->selected_wall;
+    if (w < 0 || w >= wall_counter) return;
+    Vector2 a = vertices[walls[w].point_start].points;
+    Vector2 b = vertices[walls[w].point_end].points;
+    Vector2 ab = Vector2Subtract(b, a);
+    float lenSq = Vector2LengthSqr(ab);
+    if (lenSq == 0.0f) return;
+    float t = Clamp(Vector2DotProduct(Vector2Subtract(mouseWorld, a), ab) / lenSq,
+                    0.1f, 0.9f);
+    Vector2 p = Vector2Add(a, Vector2Scale(ab, t));
+
+    int partner = walls[w].portal_wall;
+    if (!SplitWallAt(w, p)) return;
+    if (partner != NO_LINK) {
+        if (partner > w) partner++;           // shifted by the first insertion
+        SplitWallAt(partner, p);
+    }
+    RebuildNextWalls();
+    st->geometry_dirty = true;
+    EditorStatus(st, "WALL SPLIT");
+}
+
+// Attach the just-closed loop (walls [lw0, wall_counter)) as a hole in the
+// sector enclosing it. The loop's walls move from the end of walls[] into
+// the target's run so runs stay contiguous. On failure the loop is undone.
+static bool FinalizeHole(EditorState *st, int lw0) {
+    int len = wall_counter - lw0;
+    Vector2 c = { 0 };
+    for (int i = 0; i < len; i++)
+        c = Vector2Add(c, vertices[walls[lw0 + i].point_start].points);
+    c = Vector2Scale(c, 1.0f / (float)len);
+
+    int t = SectorUnderPoint(c);
+    bool ok = (t != -1) && len <= 64;
+    for (int i = 0; ok && i < len; i++)
+        if (SectorUnderPoint(vertices[walls[lw0 + i].point_start].points) != t)
+            ok = false;
+    if (!ok) {
+        wall_counter = lw0;
+        PruneOrphanVertices();
+        st->geometry_dirty = true;
+        return false;
+    }
+
+    int ip = sectors[t].wall_start + sectors[t].wall_count;
+    if (ip != lw0) {
+        Wall tmp[64];
+        memcpy(tmp, &walls[lw0], (size_t)len * sizeof(Wall));
+        memmove(&walls[ip + len], &walls[ip], (size_t)(lw0 - ip) * sizeof(Wall));
+        memcpy(&walls[ip], tmp, (size_t)len * sizeof(Wall));
+        for (int r = 0; r < sector_counter; r++)
+            if (r != t && sectors[r].wall_start >= ip) sectors[r].wall_start += len;
+    }
+    sectors[t].wall_count += len;
+    st->selected_wall = -1;
+    RebuildNextWalls();
+    st->geometry_dirty = true;
+    return true;
 }
 
 // Weld a dragged vertex onto a coincident existing vertex. Returns true if a
@@ -321,6 +529,7 @@ static void EditorLoad(EditorState *st) {
         st->drawing = false;
         st->start_vertex = st->start_wall = -1;
         st->dragged_vertex = st->selected_sector = st->selected_wall = -1;
+        st->dragged_entity = st->selected_entity = -1;
         st->rect_dragging = false;
         st->geometry_dirty = true;
         EditorStatus(st, "LOADED dev.map");
@@ -352,7 +561,7 @@ static void EditorPlaceVertex(EditorState *st, Vector2 snapped, Vector2 mouseWor
     int     wallsSoFar = wall_counter - st->start_wall;
     int     prevV = wallsSoFar > 0 ? walls[wall_counter - 1].point_end : st->start_vertex;
 
-    // close the loop -> finalise the sector
+    // close the loop -> finalise as a sector (EDIT) or a hole (HOLE mode)
     if (CheckCollisionPointCircle(mouseWorld, startPos, closeR)) {
         if (wallsSoFar >= SECTOR_VERTEX_MIN - 1 &&
             wall_counter < MAX_WALLS && sector_counter < MAX_SECTORS) {
@@ -362,18 +571,28 @@ static void EditorPlaceVertex(EditorState *st, Vector2 snapped, Vector2 mouseWor
                 .next_wall = NO_LINK, .next_sector = NO_LINK,
                 .portal_wall = NO_LINK, .texture_id = INVALID_ID,
             };
-            for (int i = st->start_wall; i < finalW; i++) walls[i].next_wall = i + 1;
-            walls[finalW].next_wall = st->start_wall;
 
-            sectors[sector_counter++] = (Sector){
-                .wall_start = st->start_wall,
-                .wall_count = wall_counter - st->start_wall,
-                .floor_z = 0.0f, .ceilingz = 10.0f,
-                .floor_texture = INVALID_ID, .ceiling_texture = INVALID_ID,
-            };
+            int lw0 = st->start_wall;
             st->drawing = false;
             st->start_vertex = -1;
             st->start_wall = -1;
+
+            if (st->mode == MODE_HOLE) {
+                EditorStatus(st, FinalizeHole(st, lw0)
+                                 ? "HOLE ADDED" : "HOLE MUST SIT INSIDE ONE SECTOR");
+                return;
+            }
+
+            for (int i = lw0; i < finalW; i++) walls[i].next_wall = i + 1;
+            walls[finalW].next_wall = lw0;
+
+            sectors[sector_counter++] = (Sector){
+                .wall_start = lw0,
+                .wall_count = wall_counter - lw0,
+                .floor_z = 0.0f, .ceilingz = 10.0f,
+                .floor_texture = INVALID_ID, .ceiling_texture = INVALID_ID,
+                .light = 1.0f,
+            };
             st->geometry_dirty = true;
         }
         return;
@@ -400,6 +619,8 @@ static void EditorHandleInput(EditorState *st, Vector2 mouseWorld, Vector2 snapp
     if (IsKeyPressed(KEY_TWO))   st->mode = MODE_DRAG;
     if (IsKeyPressed(KEY_THREE)) st->mode = MODE_SECTOR;
     if (IsKeyPressed(KEY_FOUR))  st->mode = MODE_WALL;
+    if (IsKeyPressed(KEY_FIVE))  st->mode = MODE_HOLE;
+    if (IsKeyPressed(KEY_SIX))   st->mode = MODE_ENTITY;
     if (IsKeyPressed(KEY_B))     EditorUndo(st);
 
     // save / load (Ctrl or Cmd)
@@ -419,6 +640,9 @@ static void EditorHandleInput(EditorState *st, Vector2 mouseWorld, Vector2 snapp
         if (wall_counter > st->start_wall) wall_counter--;
         else { st->drawing = false; st->start_vertex = st->start_wall = -1; }
         st->geometry_dirty = true;
+    } else if (st->mode == MODE_ENTITY && st->selected_entity != -1 &&
+               (IsKeyPressed(KEY_BACKSPACE) || IsKeyPressed(KEY_DELETE))) {
+        DeleteEntity(st, st->selected_entity);
     }
 
     // place / rotate the player start
@@ -447,11 +671,15 @@ static void EditorHandleInput(EditorState *st, Vector2 mouseWorld, Vector2 snapp
         st->dragged_vertex = -1;
         st->geometry_dirty = true;         // moved/welded geometry -> relink portals
     }
+    if (st->dragged_entity != -1 && IsMouseButtonReleased(MOUSE_LEFT_BUTTON))
+        st->dragged_entity = -1;
 
-    // finish a rectangle drag wherever the cursor ends up
+    // finish a rectangle / stair drag wherever the cursor ends up
     if (st->rect_dragging && IsMouseButtonReleased(MOUSE_LEFT_BUTTON)) {
-        CreateRectSector(st, st->rect_anchor, snapped);
+        if (st->rect_stairs) StampStairs(st, st->rect_anchor, snapped);
+        else                 CreateRectSector(st, st->rect_anchor, snapped);
         st->rect_dragging = false;
+        st->rect_stairs = false;
     }
 
     if (overGui) return;   // the rest is world interaction; let the panel have the cursor
@@ -459,9 +687,14 @@ static void EditorHandleInput(EditorState *st, Vector2 mouseWorld, Vector2 snapp
     switch (st->mode) {
     case MODE_EDIT:
         if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-            // SHIFT+drag stamps a rectangular room; plain click draws a loop
+            // SHIFT+drag stamps a rectangular room, CTRL+SHIFT+drag a
+            // staircase; plain click draws a loop
             if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
-                if (!st->drawing) { st->rect_dragging = true; st->rect_anchor = snapped; }
+                if (!st->drawing) {
+                    st->rect_dragging = true;
+                    st->rect_stairs = chord;
+                    st->rect_anchor = snapped;
+                }
             } else {
                 EditorPlaceVertex(st, snapped, mouseWorld);
             }
@@ -502,7 +735,32 @@ static void EditorHandleInput(EditorState *st, Vector2 mouseWorld, Vector2 snapp
             Wall *wl = &walls[st->selected_wall];
             if (IsKeyPressed(KEY_RIGHT_BRACKET)) wl->texture_id = CycleWorldTexture(wl->texture_id, +1);
             if (IsKeyPressed(KEY_LEFT_BRACKET))  wl->texture_id = CycleWorldTexture(wl->texture_id, -1);
+            if (IsKeyPressed(KEY_X)) SplitSelectedWall(st, mouseWorld);
         }
+        break;
+
+    case MODE_HOLE:
+        // same loop drawing as EDIT; closure attaches it as a hole
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON))
+            EditorPlaceVertex(st, snapped, mouseWorld);
+        break;
+
+    case MODE_ENTITY:
+        if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+            int hit = EntityUnderPoint(mouseWorld, 10.0f / st->camera.zoom);
+            if (hit != -1) {
+                st->selected_entity = hit;
+                st->dragged_entity = hit;
+            } else if (entity_counter < MAX_ENTITIES) {
+                entities[entity_counter] = EntityDefault(st->entity_brush_type, snapped);
+                st->selected_entity = entity_counter;
+                st->dragged_entity = entity_counter;
+                entity_counter++;
+                EditorStatus(st, "ENTITY ADDED");
+            }
+        }
+        if (st->dragged_entity != -1 && IsMouseButtonDown(MOUSE_LEFT_BUTTON))
+            entities[st->dragged_entity].pos = snapped;
         break;
     }
 }
@@ -532,21 +790,79 @@ static void EditorRenderGrid(EditorState *st) {
     }
 }
 
+static Color EntityColor(int type) {
+    switch (type) {
+    case ENT_DECAL:  return (Color){ 170, 140, 255, 255 };
+    case ENT_SPAWN:  return (Color){ 255, 95, 70, 255 };
+    case ENT_BRIDGE: return (Color){ 90, 190, 230, 255 };
+    case ENT_HEALTH: return (Color){ 230, 45, 45, 255 };
+    case ENT_AMMO:   return (Color){ 235, 170, 55, 255 };
+    default:         return COL_DIM;
+    }
+}
+
+static void EditorRenderEntities(EditorState *st) {
+    float markerR = 8.0f / st->camera.zoom;
+    float lineW = 2.0f / st->camera.zoom;
+    int font = (int)(15.0f / st->camera.zoom) + 2;
+
+    for (int i = 0; i < entity_counter; i++) {
+        const Entity *e = &entities[i];
+        Color c = EntityColor(e->type);
+        bool selected = st->selected_entity == i;
+
+        if (e->type == ENT_BRIDGE && e->sx > 0.0f && e->sy > 0.0f) {
+            float hx = e->sx / WORLD_SCALE, hy = e->sy / WORLD_SCALE;
+            DrawRectangleLinesEx((Rectangle){ e->pos.x - hx, e->pos.y - hy, hx * 2.0f, hy * 2.0f },
+                                 lineW, selected ? COL_VERTEX_HI : c);
+        }
+
+        DrawCircleV(e->pos, markerR, Fade(c, 0.8f));
+        DrawCircleLines((int)e->pos.x, (int)e->pos.y, markerR * (selected ? 1.8f : 1.25f),
+                        selected ? COL_VERTEX_HI : COL_DARK);
+
+        if (e->type == ENT_SPAWN) {
+            Vector2 tip = Vector2Add(e->pos, Vector2Scale((Vector2){ cosf(e->yaw), sinf(e->yaw) },
+                                                          markerR * 2.6f));
+            DrawLineEx(e->pos, tip, lineW, COL_VERTEX_HI);
+        } else if (e->type == ENT_HEALTH) {
+            DrawLineEx((Vector2){ e->pos.x - markerR, e->pos.y },
+                       (Vector2){ e->pos.x + markerR, e->pos.y }, lineW, COL_VERTEX_HI);
+            DrawLineEx((Vector2){ e->pos.x, e->pos.y - markerR },
+                       (Vector2){ e->pos.x, e->pos.y + markerR }, lineW, COL_VERTEX_HI);
+        }
+
+        if (st->camera.zoom > 0.35f)
+            DrawText(EntityTypeName(e->type), (int)(e->pos.x + markerR + 4.0f),
+                     (int)(e->pos.y - markerR), font, selected ? COL_VERTEX_HI : c);
+    }
+}
+
 static void EditorRenderWorld(EditorState *st, Vector2 mouseWorld, Vector2 snapped) {
     float vertexR = 4.0f / st->camera.zoom;
     float pickR   = 6.0f / st->camera.zoom;
 
-    // selected sector: translucent fill + outline beneath the geometry
+    // selected sector: triangulated translucent fill (concave/holed safe)
+    // + outline, hinge wall (the slope reference) called out in orange
     if (st->selected_sector != -1) {
         int hs = sectors[st->selected_sector].wall_start;
         int hn = sectors[st->selected_sector].wall_count;
-        if (hn >= 3) {
-            Vector2 poly[MAX_WALLS];
-            for (int i = 0; i < hn; i++) poly[i] = vertices[walls[hs + i].point_start].points;
-            DrawTriangleFan(poly, hn, COL_SEL);
+        if (hn >= 3 && hn <= 512) {
+            static Vector2 pts[512];
+            static Vector2 tri[256 * 3];
+            for (int i = 0; i < hn; i++) pts[i] = vertices[walls[hs + i].point_start].points;
+            int lc[16];
+            int nl = WorldSectorLoops(st->selected_sector, lc, 16);
+            int ntris = TriangulatePolygon(pts, lc, nl, tri, 256);
+            rlDisableBackfaceCulling();
+            for (int t = 0; t < ntris; t++)
+                DrawTriangle(tri[t * 3], tri[t * 3 + 1], tri[t * 3 + 2], COL_SEL);
+            rlEnableBackfaceCulling();
             for (int i = 0; i < hn; i++)
-                DrawLineEx(poly[i], vertices[walls[hs + i].point_end].points,
+                DrawLineEx(pts[i], vertices[walls[hs + i].point_end].points,
                            3.0f / st->camera.zoom, COL_SEL_LINE);
+            DrawLineEx(pts[0], vertices[walls[hs].point_end].points,
+                       5.0f / st->camera.zoom, (Color){ 255, 170, 60, 255 });
         }
     }
 
@@ -564,13 +880,30 @@ static void EditorRenderWorld(EditorState *st, Vector2 mouseWorld, Vector2 snapp
         DrawLineEx(a, b, 4.0f / st->camera.zoom, COL_SEL_LINE);
     }
 
-    // rectangle tool preview while shift-dragging
+    // rectangle / stair tool preview while shift-dragging
     if (st->rect_dragging) {
         float x0 = fminf(st->rect_anchor.x, snapped.x), x1 = fmaxf(st->rect_anchor.x, snapped.x);
         float y0 = fminf(st->rect_anchor.y, snapped.y), y1 = fmaxf(st->rect_anchor.y, snapped.y);
         DrawRectangleRec((Rectangle){ x0, y0, x1 - x0, y1 - y0 }, COL_SEL);
         DrawRectangleLinesEx((Rectangle){ x0, y0, x1 - x0, y1 - y0 },
                              2.0f / st->camera.zoom, COL_SEL_LINE);
+
+        if (st->rect_stairs) {
+            // step divisions along the dominant drag axis + a step count
+            float dx = snapped.x - st->rect_anchor.x, dy = snapped.y - st->rect_anchor.y;
+            bool alongX = fabsf(dx) >= fabsf(dy);
+            int steps = (int)roundf((alongX ? fabsf(dx) : fabsf(dy)) / GRID_SPACING);
+            for (int i = 1; i < steps; i++) {
+                float c = (alongX ? x0 : y0) + (float)i * GRID_SPACING;
+                if (alongX) DrawLineEx((Vector2){ c, y0 }, (Vector2){ c, y1 },
+                                       1.5f / st->camera.zoom, COL_SEL_LINE);
+                else        DrawLineEx((Vector2){ x0, c }, (Vector2){ x1, c },
+                                       1.5f / st->camera.zoom, COL_SEL_LINE);
+            }
+            DrawText(TextFormat("%d STEPS  +%.1f", steps, steps * STAIR_RISE),
+                     (int)x0, (int)y0 - (int)(20.0f / st->camera.zoom),
+                     (int)(16.0f / st->camera.zoom) + 2, COL_HOT);
+        }
     }
 
     // vertices as squares, brighter on hover / drag
@@ -607,6 +940,8 @@ static void EditorRenderWorld(EditorState *st, Vector2 mouseWorld, Vector2 snapp
     Vector2 tip = Vector2Add(playerStart, Vector2Scale(facing, markerR * 2.5f));
     DrawCircleV(playerStart, markerR, GREEN);
     DrawLineEx(playerStart, tip, 2.0f / st->camera.zoom, LIME);
+
+    EditorRenderEntities(st);
 }
 
 // One-time retro phosphor styling for the raygui widgets (toggles, sliders,
@@ -683,7 +1018,9 @@ static void EditorRenderGui(EditorState *st, Vector2 snapped) {
 
     const char *modeName = st->mode == MODE_EDIT ? "EDIT"
                          : st->mode == MODE_DRAG ? "DRAG"
-                         : st->mode == MODE_SECTOR ? "SECTOR" : "WALL";
+                         : st->mode == MODE_SECTOR ? "SECTOR"
+                         : st->mode == MODE_WALL ? "WALL"
+                         : st->mode == MODE_HOLE ? "HOLE" : "ENTITY";
 
     // ---- header -----------------------------------------------------------
     BevelRaised((Rectangle){ 0, 0, W, HEADER_H }, COL_HEADER);
@@ -699,16 +1036,17 @@ static void EditorRenderGui(EditorState *st, Vector2 snapped) {
     float x = px + PAD, w = PANEL_W - PAD * 2, y = HEADER_H + PAD;
 
     // mode switch
-    SectionBar(x, y, w, "MODE   1 2 3 4");  y += 24;
+    SectionBar(x, y, w, "MODE   1 2 3 4 5 6");  y += 24;
     int modeIdx = (int)st->mode;
-    GuiToggleGroup((Rectangle){ x, y, (w - 12) / 4.0f, 24 }, "EDIT;DRAG;SECTOR;WALL", &modeIdx);
+    GuiToggleGroup((Rectangle){ x, y, (w - 20) / 6.0f, 24 }, "EDIT;DRAG;SECT;WALL;HOLE;ENT", &modeIdx);
     st->mode = (EditorMode)modeIdx;       y += 24 + PAD;
 
     // world stats
     SectionBar(x, y, w, "WORLD");  y += 22;
     DrawText(TextFormat("SECTORS  %4d / %d", sector_counter, MAX_SECTORS), (int)x + 2, (int)y, 16, COL_TEXT); y += 18;
     DrawText(TextFormat("WALLS    %4d / %d", wall_counter, MAX_WALLS),     (int)x + 2, (int)y, 16, COL_TEXT); y += 18;
-    DrawText(TextFormat("VERTS    %4d", vertex_counter),                   (int)x + 2, (int)y, 16, COL_TEXT); y += 18 + PAD;
+    DrawText(TextFormat("VERTS    %4d", vertex_counter),                   (int)x + 2, (int)y, 16, COL_TEXT); y += 18;
+    DrawText(TextFormat("ENTS     %4d / %d", entity_counter, MAX_ENTITIES), (int)x + 2, (int)y, 16, COL_TEXT); y += 18 + PAD;
 
     // selected sector tools
     SectionBar(x, y, w, "SELECTED SECTOR");  y += 22;
@@ -728,7 +1066,31 @@ static void EditorRenderGui(EditorState *st, Vector2 snapped) {
 
         if (sec->floor_z > sec->ceilingz - 0.5f) sec->floor_z = sec->ceilingz - 0.5f;
 
-        DrawText(TextFormat("HEIGHT   %.1f", sec->ceilingz - sec->floor_z), (int)x + 2, (int)y, 16, COL_TEXT); y += 22;
+        // slopes, shown as world-unit rise per grid cell about the orange
+        // hinge wall (player step-up is 1.8/cell - keep ramps under that)
+        float frise = sec->floor_slope * GRID_SPACING;
+        DrawText("F SLP", (int)x + 2, (int)y + 2, 16, COL_DIM);
+        GuiSliderBar((Rectangle){ x + 54, y, w - 108, 20 }, NULL, NULL, &frise, -2.0f, 2.0f);
+        sec->floor_slope = frise / GRID_SPACING;
+        DrawText(TextFormat("%+4.2f", frise), (int)(x + w - 46), (int)y + 2, 16, COL_HOT); y += 24;
+
+        float crise = sec->ceil_slope * GRID_SPACING;
+        DrawText("C SLP", (int)x + 2, (int)y + 2, 16, COL_DIM);
+        GuiSliderBar((Rectangle){ x + 54, y, w - 108, 20 }, NULL, NULL, &crise, -2.0f, 2.0f);
+        sec->ceil_slope = crise / GRID_SPACING;
+        DrawText(TextFormat("%+4.2f", crise), (int)(x + w - 46), (int)y + 2, 16, COL_HOT); y += 24;
+
+        DrawText("LIGHT", (int)x + 2, (int)y + 2, 16, COL_DIM);
+        GuiSliderBar((Rectangle){ x + 54, y, w - 108, 20 }, NULL, NULL, &sec->light, 0.0f, 1.5f);
+        DrawText(TextFormat("%4.2f", sec->light), (int)(x + w - 46), (int)y + 2, 16, COL_HOT); y += 24;
+
+        if (GuiButton((Rectangle){ x, y, (w - 6) / 2, 22 }, "HINGE >"))
+            RotateSectorHinge(st, st->selected_sector);
+        if (GuiButton((Rectangle){ x + (w + 6) / 2, y, (w - 6) / 2, 22 }, "FLATTEN")) {
+            sec->floor_slope = 0.0f;
+            sec->ceil_slope = 0.0f;
+        }
+        y += 26;
 
         sec->floor_texture   = TexPickerRow(x, y, w, "FLR TEX",  sec->floor_texture);   y += 26;
         sec->ceiling_texture = TexPickerRow(x, y, w, "CEIL TEX", sec->ceiling_texture); y += 26;
@@ -756,6 +1118,76 @@ static void EditorRenderGui(EditorState *st, Vector2 snapped) {
         DrawText("WALL mode to paint", (int)x + 2, (int)y, 16, COL_DIM);  y += 18 + PAD;
     }
 
+    // entity tools
+    if (st->selected_entity >= entity_counter) st->selected_entity = -1;
+    SectionBar(x, y, w, "ENTITY");  y += 22;
+    if (st->selected_entity != -1) {
+        Entity *e = &entities[st->selected_entity];
+        DrawText(TextFormat("#%d   %s", st->selected_entity, EntityTypeName(e->type)),
+                 (int)x + 2, (int)y, 16, COL_TEXT); y += 22;
+
+        int type = e->type;
+        GuiToggleGroup((Rectangle){ x, y, (w - 16) / 5.0f, 22 }, "DEC;SPN;BRG;AMMO;HP", &type);
+        if (type != e->type) *e = EntityDefault(type, e->pos);
+        y += 24;
+
+        DrawText(TextFormat("POS   %.0f, %.0f", e->pos.x, e->pos.y), (int)x + 2, (int)y, 16, COL_TEXT); y += 20;
+
+        if (e->type == ENT_AMMO) {
+            int ammo = e->data == AMMO_BULLETS ? AMMO_BULLETS : AMMO_SHELLS;
+            GuiToggleGroup((Rectangle){ x, y, (w - 4) / 2.0f, 22 }, "SHELL;BULLET", &ammo);
+            e->data = ammo;
+            y += 24;
+
+            float max = ammo == AMMO_SHELLS ? 32.0f : 120.0f;
+            if (e->sx <= 0.0f) e->sx = ammo == AMMO_SHELLS ? 8.0f : 40.0f;
+            e->sx = Clamp(e->sx, 1.0f, max);
+            DrawText("AMOUNT", (int)x + 2, (int)y + 2, 16, COL_DIM);
+            GuiSliderBar((Rectangle){ x + 72, y, w - 124, 20 }, NULL, NULL, &e->sx, 1.0f, max);
+            e->sx = roundf(e->sx);
+            DrawText(TextFormat("%3.0f", e->sx), (int)(x + w - 42), (int)y + 2, 16, COL_HOT); y += 24;
+        } else if (e->type == ENT_HEALTH) {
+            float amount = (float)(e->data > 0 ? e->data : 25);
+            DrawText("AMOUNT", (int)x + 2, (int)y + 2, 16, COL_DIM);
+            GuiSliderBar((Rectangle){ x + 72, y, w - 124, 20 }, NULL, NULL, &amount, 1.0f, 100.0f);
+            e->data = (int)roundf(amount);
+            DrawText(TextFormat("%3d", e->data), (int)(x + w - 42), (int)y + 2, 16, COL_HOT); y += 24;
+        } else {
+            DrawText("Z", (int)x + 2, (int)y + 2, 16, COL_DIM);
+            GuiSliderBar((Rectangle){ x + 54, y, w - 108, 20 }, NULL, NULL, &e->z, -10.0f, 40.0f);
+            DrawText(TextFormat("%5.1f", e->z), (int)(x + w - 46), (int)y + 2, 16, COL_HOT); y += 24;
+
+            float yawDeg = e->yaw * RAD2DEG;
+            DrawText("YAW", (int)x + 2, (int)y + 2, 16, COL_DIM);
+            GuiSliderBar((Rectangle){ x + 54, y, w - 108, 20 }, NULL, NULL, &yawDeg, -180.0f, 180.0f);
+            e->yaw = yawDeg * DEG2RAD;
+            DrawText(TextFormat("%4.0f", yawDeg), (int)(x + w - 46), (int)y + 2, 16, COL_HOT); y += 24;
+
+            DrawText("SX", (int)x + 2, (int)y + 2, 16, COL_DIM);
+            GuiSliderBar((Rectangle){ x + 54, y, w - 108, 20 }, NULL, NULL, &e->sx, 0.1f, 8.0f);
+            DrawText(TextFormat("%4.1f", e->sx), (int)(x + w - 46), (int)y + 2, 16, COL_HOT); y += 24;
+
+            DrawText("SY", (int)x + 2, (int)y + 2, 16, COL_DIM);
+            GuiSliderBar((Rectangle){ x + 54, y, w - 108, 20 }, NULL, NULL, &e->sy, 0.1f, 8.0f);
+            DrawText(TextFormat("%4.1f", e->sy), (int)(x + w - 46), (int)y + 2, 16, COL_HOT); y += 24;
+
+            if (e->type == ENT_DECAL || e->type == ENT_BRIDGE) {
+                e->texture_id = TexPickerRow(x, y, w, "TEX", e->texture_id);
+                y += 26;
+            }
+        }
+
+        if (GuiButton((Rectangle){ x, y, w, 22 }, "DELETE ENTITY   DEL"))
+            DeleteEntity(st, st->selected_entity);
+        y += 22 + PAD;
+    } else {
+        int brush = st->entity_brush_type;
+        GuiToggleGroup((Rectangle){ x, y, (w - 16) / 5.0f, 22 }, "DEC;SPN;BRG;AMMO;HP", &brush);
+        st->entity_brush_type = brush;
+        y += 24;
+        DrawText("click in ENTITY mode", (int)x + 2, (int)y, 16, COL_DIM); y += 18 + PAD;
+    }
+
     // player start
     SectionBar(x, y, w, "PLAYER START   P Q E");  y += 22;
     DrawText(TextFormat("POS   %.0f, %.0f", playerStart.x, playerStart.y), (int)x + 2, (int)y, 16, COL_TEXT); y += 18;
@@ -769,21 +1201,19 @@ static void EditorRenderGui(EditorState *st, Vector2 snapped) {
 
     // help
     SectionBar(x, y, w, "KEYS");  y += 22;
-    DrawText("LMB  draw / select / drag", (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("SHIFT+drag  rect room",     (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("BKSP undo wall (drawing)",  (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("RMB  pan      WHEEL zoom",  (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("R/T  ceil     F/G   floor", (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("[ ]  wall texture",         (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("^S   save     ^O    load",  (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("F5   reload textures",      (int)x + 2, (int)y, 16, COL_DIM); y += 18;
-    DrawText("B    undo last sector",     (int)x + 2, (int)y, 16, COL_DIM);
+    DrawText("LMB draw SHIFT rect ^SHIFT str", (int)x + 2, (int)y, 16, COL_DIM); y += 18;
+    DrawText("5 HOLE   6 ENTITY   DEL ent",    (int)x + 2, (int)y, 16, COL_DIM); y += 18;
+    DrawText("X split wall   LMB place/select", (int)x + 2, (int)y, 16, COL_DIM); y += 18;
+    DrawText("R/T ceil  F/G floor  B undo",    (int)x + 2, (int)y, 16, COL_DIM); y += 18;
+    DrawText("[ ] wall tex   F5 reload",       (int)x + 2, (int)y, 16, COL_DIM); y += 18;
+    DrawText("^S save  ^O load  BKSP wall",    (int)x + 2, (int)y, 16, COL_DIM); y += 18;
+    DrawText("RMB pan   WHEEL zoom",           (int)x + 2, (int)y, 16, COL_DIM);
 
     // ---- status bar -------------------------------------------------------
     BevelRaised((Rectangle){ 0, H - STATUS_H, W, STATUS_H }, COL_HEADER);
     DrawText(TextFormat("CURSOR %d, %d", gx, gy), 10, H - STATUS_H + 5, 16, COL_HOT);
     DrawText(TextFormat("%s", modeName), 200, H - STATUS_H + 5, 16, COL_VERTEX);
-    DrawText(TextFormat("S:%d  W:%d  V:%d", sector_counter, wall_counter, vertex_counter),
+    DrawText(TextFormat("S:%d  W:%d  V:%d  E:%d", sector_counter, wall_counter, vertex_counter, entity_counter),
              320, H - STATUS_H + 5, 16, COL_TEXT);
     if (st->status_timer > 0.0f)
         DrawText(st->status_msg, 520, H - STATUS_H + 5, 16, COL_HOT);

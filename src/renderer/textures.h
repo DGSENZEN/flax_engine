@@ -39,4 +39,9 @@ Texture2D    TexRegistryTexture(int index);
 // obviously wrong instead of crashing, the id-software way.
 int TexRegistryResolve(int world_texture_id);
 
+// Registry index by name (canonicalized like everything else), or -1.
+// For code that needs a specific texture (decals, effects) rather than a
+// world-referenced one.
+int TexRegistryFind(const char *name);
+
 #endif // FLAX_TEXTURES_H

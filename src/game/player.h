@@ -23,4 +23,14 @@ void PlayerApplyCamera(Camera *camera);
 float PlayerSpeedXZ(void);
 bool  PlayerOnGround(void);
 
+// Feet position in world units (enemies chase this).
+Vector3 PlayerPosition(void);
+
+// Combat state: damage respawns the player at 0 hp; hurt flash is 1 on the
+// hit decaying to 0 (drives the HUD red overlay).
+void  PlayerDamage(float dmg);
+bool  PlayerGiveHealth(float amount);
+float PlayerHealth(void);
+float PlayerHurtFlash(void);
+
 #endif // FLAX_PLAYER_H

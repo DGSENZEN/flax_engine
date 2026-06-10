@@ -4,7 +4,13 @@
 #include "renderer/sectors.h"
 #include "renderer/textures.h"
 #include "io/flaxmap.h"
+#include "world/raycast.h"
 #include "game/player.h"
+#include "game/weapons.h"
+#include "game/enemies.h"
+#include "entity/entity.h"
+#include "renderer/decals.h"
+#include "renderer/lights.h"
 #include "core/log.h"
 #include "core/profiler.h"
 #include "main.h"
@@ -13,6 +19,9 @@
 #include <raymath.h>
 #include <stdbool.h>
 
+// Low-res canvas. 320x180 matches the window's 16:9-ish aspect, so the
+// upscale is uniform - a 320x200 canvas here gets stretched ~11% wider,
+// which warps the view against the aim and the projected muzzle flash.
 #define DOS_RES_X 320
 #define DOS_RES_Y 200
 
@@ -31,6 +40,16 @@ void debugMovement(Camera *camera){
     DrawText(TextFormat("Target: (X: %06.3f, Y: %06.3f, Z: %06.3f)", camera->target.x, camera->target.y, camera->target.z), 30, 30, 20, BLACK);
 };
 
+void drawCrosshair(void){
+    int cx = SCREEN_WIDTH / 2, cy = SCREEN_HEIGHT / 2;
+    Color shadow = Fade(BLACK, 0.6f);
+    // ticks with a 1px drop shadow so they read on bright and dark surfaces
+    DrawRectangle(cx - 9, cy,     6, 2, shadow); DrawRectangle(cx - 10, cy - 1, 6, 2, RAYWHITE);
+    DrawRectangle(cx + 5, cy,     6, 2, shadow); DrawRectangle(cx + 4,  cy - 1, 6, 2, RAYWHITE);
+    DrawRectangle(cx,     cy - 9, 2, 6, shadow); DrawRectangle(cx - 1,  cy - 10, 2, 6, RAYWHITE);
+    DrawRectangle(cx,     cy + 5, 2, 6, shadow); DrawRectangle(cx - 1,  cy + 4, 2, 6, RAYWHITE);
+};
+
 
 int main(void) {
 
@@ -41,22 +60,13 @@ int main(void) {
     SetTargetFPS(60);
     FlaxScreen currentScr = GAME;
 
-    //setup the player sprite
-    Texture2D weaponTex = LoadTexture("assets/sprites/player_test_sprite.png");
-    float texScale = 4.5f;
-    float frameWidth = (float) weaponTex.width;
-    float frameHeight = (float) weaponTex.height;
-    Vector2 weaponScreenPos = {
-        (SCREEN_WIDTH - (frameWidth * texScale)),
-        (SCREEN_HEIGHT - (frameHeight * texScale) + 20.0f)
-    };
-
     //setting up the low-res canvas for dos-like rendering
     RenderTexture2D dosResCanvas = LoadRenderTexture(DOS_RES_X, DOS_RES_Y);
     SetTextureFilter(dosResCanvas.texture, TEXTURE_FILTER_POINT);
     DisableCursor();
 
     TexturesInit();
+    LightsInit();
 
     // boot map: prefer the baked binary (the runtime artifact), fall back to
     // the text source so a freshly edited map still loads without a bake step
@@ -69,6 +79,9 @@ int main(void) {
     }
     BuildSectorMeshes();
     PlayerSpawn(playerStart, playerStartYaw);
+    WeaponsInit();
+    EnemiesInit();
+    EntitySystemInit();
 
     while (!WindowShouldClose()) {
         ProfFrameStart();
@@ -87,6 +100,10 @@ int main(void) {
                 DisableCursor();
                 BuildSectorMeshes();
                 PlayerSpawn(playerStart, playerStartYaw);
+                DecalsClear();       // geometry may have changed under them
+                WeaponsInit();
+                EnemiesInit();
+                EntitySystemInit();
                 FLOG_INFO(LOGCAT_GAME, "entered game");
             }
         }
@@ -105,14 +122,21 @@ int main(void) {
             PlayerUpdate(dt);          // movement, collision, gravity (profiled inside)
             PlayerApplyCamera(&camera);
 
-            // weapon bob from actual horizontal speed, grounded only
-            Rectangle sourceRec = { 0.0f, 0.0f, frameWidth, frameHeight };
-            Vector2 bob = {0};
-            if (PlayerOnGround() && PlayerSpeedXZ() > 1.0f) {
-                bob.x = sinf(GetTime() * 10.0f) * 4.0f;
-                bob.y = cosf(GetTime() * 20.0f) * 6.0f;
+            Vector3 viewDir = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+            LightsBeginFrame(dt);                  // weapons push dlights below
+            WeaponsUpdate(dt, camera);
+            EntitySystemUpdate(dt);
+            EnemiesUpdate(dt);
+            SectorWorldRelight();                  // CPU vertex lighting
+
+            // T drops a test zombie where the crosshair points
+            if (IsKeyPressed(KEY_T)) {
+                RayHit th;
+                if (WorldRaycast(camera.position, viewDir, 300.0f, &th)) {
+                    Vector3 at = Vector3Add(th.pos, Vector3Scale(th.normal, 1.5f));
+                    EnemySpawn((Vector2){ at.x / WORLD_SCALE, at.z / WORLD_SCALE });
+                }
             }
-            Rectangle destRec = {weaponScreenPos.x + bob.x, weaponScreenPos.y + bob.y, frameWidth * texScale, frameHeight * texScale};
 
             // world pass onto the low-res canvas
             PROF_BEGIN("world 3d");
@@ -120,6 +144,10 @@ int main(void) {
             ClearBackground(RAYWHITE);
             BeginMode3D(camera);
             DrawSectorWorld();
+            DecalsDraw();
+            EntitySystemDraw3D(camera);
+            EnemiesDraw3D(camera);
+            WeaponsDraw3D(camera);
             EndMode3D();
             EndTextureMode();
             PROF_END("world 3d");
@@ -132,9 +160,26 @@ int main(void) {
                 (Rectangle){0, 0, (float)SCREEN_WIDTH, (float)SCREEN_HEIGHT},
                 (Vector2){0,0}, 0.0f, WHITE);
 
-            DrawTexturePro(weaponTex, sourceRec, destRec, (Vector2){6, -2}, 0.0f, WHITE);
+            // hurt flash: red wash over the world, under the gun
+            float hurt = PlayerHurtFlash();
+            if (hurt > 0.01f)
+                DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, Fade(RED, 0.35f * hurt));
+
+            WeaponsDrawHUD();
+            drawCrosshair();
+
+            // health readout, Doom-corner style
+            float hp = PlayerHealth();
+            Color hpCol = hp > 50 ? RAYWHITE : hp > 25 ? ORANGE : RED;
+            DrawText(TextFormat("%3.0f", hp), 22, SCREEN_HEIGHT - 58, 50, Fade(BLACK, 0.5f));
+            DrawText(TextFormat("%3.0f", hp), 20, SCREEN_HEIGHT - 60, 50, hpCol);
+            DrawText("HEALTH", 22, SCREEN_HEIGHT - 78, 16, Fade(hpCol, 0.8f));
+            DrawText(WeaponName(), 22, SCREEN_HEIGHT - 100, 16, Fade(RAYWHITE, 0.7f));
+            DrawText(WeaponAmmoText(), 22, SCREEN_HEIGHT - 118, 16, Fade(RAYWHITE, 0.7f));
+
             debugMovement(&camera);
-            DrawText(TextFormat("sectors:%d walls:%d verts:%d", sector_counter, wall_counter, vertex_counter),
+            DrawText(TextFormat("sectors:%d walls:%d verts:%d enemies:%d pickups:%d  [T spawn]",
+                sector_counter, wall_counter, vertex_counter, EnemiesAlive(), EntityPickupsRemaining()),
                 15, 60, 20, RED);
             PROF_END("blit + hud");
         }
@@ -143,7 +188,6 @@ int main(void) {
         EndDrawing();
     }
 
-    UnloadTexture(weaponTex);
     UnloadRenderTexture(dosResCanvas);
     UnloadSectorMeshes();
     TexturesUnload();

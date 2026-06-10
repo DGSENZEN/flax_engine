@@ -1,5 +1,6 @@
 #include "world/world.h"
 #include "config.h"
+#include <raymath.h>
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
@@ -22,7 +23,9 @@ int entity_counter = 0;
 Vector2 playerStart    = { 0.0f, 0.0f };
 float   playerStartYaw = 0.0f;
 
-static const char *ENT_NAMES[ENT_TYPE_COUNT] = { "DECAL", "SPAWN", "BRIDGE" };
+static const char *ENT_NAMES[ENT_TYPE_COUNT] = {
+    "DECAL", "SPAWN", "BRIDGE", "AMMO", "HEALTH"
+};
 
 const char *EntityTypeName(int type) {
     return (type >= 0 && type < ENT_TYPE_COUNT) ? ENT_NAMES[type] : "?";
@@ -91,6 +94,24 @@ static bool PointInSector(Vector2 p, int s) {
     return in;
 }
 
+int WorldSectorLoops(int s, int *loop_counts, int max_loops) {
+    if (s < 0 || s >= sector_counter) return 0;
+    int start = sectors[s].wall_start, n = sectors[s].wall_count;
+    int count = 0, len = 0;
+    int first = walls[start].point_start;
+    for (int i = 0; i < n; i++) {
+        len++;
+        if (walls[start + i].point_end == first) {       // chain closed
+            if (count < max_loops) loop_counts[count] = len;
+            count++;
+            len = 0;
+            if (i + 1 < n) first = walls[start + i + 1].point_start;
+        }
+    }
+    if (len > 0 && count < max_loops) loop_counts[count++] = len;  // unclosed tail
+    return count > max_loops ? max_loops : count;
+}
+
 int WorldSectorAt(Vector2 p) {
     for (int s = 0; s < sector_counter; s++) {
         if (sectors[s].wall_count < 3) continue;
@@ -125,6 +146,33 @@ float WorldCeilZAt(int s, Vector2 p) {
     if (sectors[s].ceil_slope != 0.0f && sectors[s].wall_count > 0)
         z += sectors[s].ceil_slope * HingeDistance(s, p);
     return z;
+}
+
+// Tilted plane normal from the hinge wall: the height gradient in world xz
+// is slope/WORLD_SCALE along the hinge's left normal, so the plane normal
+// leans away from the rise. Flat sectors short-circuit to straight up.
+static Vector3 PlaneNormalOf(int s, float slope) {
+    Vector3 n = { 0.0f, 1.0f, 0.0f };
+    if (slope != 0.0f && sectors[s].wall_count > 0) {
+        int w = sectors[s].wall_start;
+        Vector2 a = vertices[walls[w].point_start].points;
+        Vector2 b = vertices[walls[w].point_end].points;
+        Vector2 e = Vector2Normalize(Vector2Subtract(b, a));
+        n = Vector3Normalize((Vector3){  slope * e.y / WORLD_SCALE,
+                                         1.0f,
+                                        -slope * e.x / WORLD_SCALE });
+    }
+    return n;
+}
+
+Vector3 WorldFloorNormal(int s) {
+    if (s < 0 || s >= sector_counter) return (Vector3){ 0, 1, 0 };
+    return PlaneNormalOf(s, sectors[s].floor_slope);
+}
+
+Vector3 WorldCeilNormal(int s) {
+    if (s < 0 || s >= sector_counter) return (Vector3){ 0, -1, 0 };
+    return Vector3Negate(PlaneNormalOf(s, sectors[s].ceil_slope));
 }
 
 void WorldClear(void) {
