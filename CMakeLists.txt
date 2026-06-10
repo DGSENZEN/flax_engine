@@ -31,3 +31,23 @@ endif()
 # regardless of the current working directory.
 target_compile_definitions(flax PRIVATE
     FLAX_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+
+# ---------------------------------------------------------------------------
+# flaxpack - offline map compiler / unpacker (text .map <-> baked .fmap).
+# Links only the world data and the serializer; no editor, no renderer.
+# raylib is linked for its header types (Vector2) and file API.
+# ---------------------------------------------------------------------------
+add_executable(flaxpack
+    tools/flaxpack.c
+    src/world/world.c
+    src/io/flaxmap.c)
+
+target_include_directories(flaxpack PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(flaxpack PRIVATE raylib)
+
+if(APPLE)
+    target_link_libraries(flaxpack PRIVATE
+        "-framework IOKit"
+        "-framework Cocoa"
+        "-framework OpenGL")
+endif()
